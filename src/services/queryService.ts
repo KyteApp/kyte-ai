@@ -3,7 +3,9 @@ import { OpenAIEmbeddings } from '@langchain/openai';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
+import { MemoryVariables } from '@langchain/core/memory';
 import { getDb } from '../config/mongodb.js';
+import { ConversationManager } from './ConversationManager.js';
 
 dotenv.config();
 
@@ -15,6 +17,7 @@ interface QueryEmbeddingsOptions extends QueryVectorStoreOptions {
   enableAPIQuery?: boolean;
   context?: any;
   language?: string;
+  userId?: string;
 }
 
 interface QueryEmbeddingsResponse {
@@ -31,12 +34,12 @@ interface QueryEmbeddingsResponse {
 const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const index = pinecone.index(process.env.PINECONE_INDEX_NAME);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const cache = new NodeCache({ stdTTL: 3600, maxKeys: 1000 });
 const embeddings = new OpenAIEmbeddings({
   openAIApiKey: process.env.OPENAI_API_KEY,
   modelName: 'text-embedding-ada-002', // model that generates 1536 dimensions
 });
-
-const cache = new NodeCache({ stdTTL: 3600, maxKeys: 1000 });
+const conversationManager = new ConversationManager();
 
 async function retry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
   for (let i = 0; i < maxRetries; i++) {
@@ -124,6 +127,18 @@ async function queryExternalAPI(apiName: string, payload: any) {
   return [{ data: 'Mock API response' }];
 }
 
+function formatChatHistory(chatHistory: MemoryVariables): string {
+  if (!chatHistory.chat_history || !chatHistory.chat_history.length) {
+    return 'No previous conversation';
+  }
+
+  return chatHistory.chat_history.map((msg: any) => `${msg.type}: ${msg.content}`).join('\n');
+}
+
+function formatContexts(contexts: any[]): string {
+  return contexts.map((c) => c.text).join('\n\n');
+}
+
 export async function queryEmbeddings(
   query: string,
   options: QueryEmbeddingsOptions = {},
@@ -160,9 +175,20 @@ export async function queryEmbeddings(
     apiResults = await queryExternalAPI('mockAPI', { query, contexts });
   }
 
-  const content = `Query: "${query}"\n\nContexts:\n${contexts
-    .map((c) => c.text)
-    .join('\n\n')}\n\nAPI Results:\n${JSON.stringify(apiResults)}`;
+  const memory = await conversationManager.getMemory(options.userId);
+  const chatHistory = await memory.loadMemoryVariables({});
+
+  const content = [
+    `Query: "${query}"`,
+    '',
+    'Chat History:',
+    formatChatHistory(chatHistory),
+    '',
+    'Contexts:',
+    formatContexts(contexts),
+  ].join('\n');
+
+  console.log('System Prompt:', content);
 
   const completion = await retry(() =>
     openai.chat.completions.create({
@@ -175,37 +201,11 @@ export async function queryEmbeddings(
         },
       ],
       temperature: 0.3,
-
-      // Parte avançada do prompt-engineering. Deixei as opções abaixo comentadas para caso precisem ser utilizadas:
-
-      // Limite de tokens da responsta:
-      // max_tokens: 500,
-
-      // Configuração para punir repetições (-2.0 to 2.0)
-      // frequency_penalty: 0.5,
-
-      // Configuração para punir novos tópicos de conversa (-2.0 to 2.0)
-      // presence_penalty: 0.2,
-
-      // Recurso de probabilidades de log (log probabilities) na API da OpenAI.
-      // Isso faz com que a API retorne os valores de probabilidade logarítmica para os tokens mais relevantes.
-
-      // logprobs: 5,
-
-      // Número de completions para trazer e então escolher a melhor
-      // n: 3,
-
-      // Stream response (processar dados em tempo real)
-      // stream: true,
-
-      // Stop sequence para definir o final de uma resposta
-      // stop: ["\n", "END"]
-
-      // PS: Não cheguei a testar todas.
     }),
   );
 
-  console.log('AI Response:', completion.choices[0].message.content);
+  // Save the interaction to memory
+  await memory.saveContext({ input: query }, { output: completion.choices[0].message.content });
 
   const result: QueryEmbeddingsResponse = {
     matches: contexts,

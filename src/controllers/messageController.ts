@@ -64,6 +64,7 @@ export async function handleIncomingMessage(body: any) {
       const aiResponse = await queryEmbeddings(userMessage, {
         context: lastConversation,
         language: userLanguage,
+        userId,
       });
       console.log(`AI Response: "${aiResponse.answer}"`);
 
